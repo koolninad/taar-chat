@@ -1,0 +1,516 @@
+import { PrismaClient } from '@prisma/client';
+import AWS from 'aws-sdk';
+import { RedisService } from './redis.service';
+import { AppError, ErrorMessages } from '@/utils/errors';
+import { logger } from '@/utils/logger';
+import { config } from '@/config';
+import crypto from 'crypto';
+import path from 'path';
+
+const prisma = new PrismaClient();
+
+// Configure AWS SDK v2
+AWS.config.update({
+  region: config.aws.region,
+  accessKeyId: config.aws.accessKeyId,
+  secretAccessKey: config.aws.secretAccessKey
+});
+
+const s3 = new AWS.S3();
+
+export interface UploadUrlRequest {
+  filename: string;
+  mimeType: string;
+  fileSize: number;
+  encryptionKey?: string;
+  userId: string;
+}
+
+export interface MediaFileResponse {
+  id: string;
+  filename: string;
+  originalFilename: string;
+  mimeType: string;
+  fileSize: number;
+  s3Key: string;
+  isEncrypted: boolean;
+  uploadedBy: string;
+  uploadedAt: Date;
+  url?: string;
+  thumbnailUrl?: string;
+}
+
+export interface UploadUrlResponse {
+  uploadUrl: string;
+  mediaFileId: string;
+  expiresIn: number;
+  maxFileSize: number;
+}
+
+export class MediaService {
+  private static readonly BUCKET_NAME = config.aws.s3BucketName;
+  private static readonly MAX_FILE_SIZE = 100 * 1024 * 1024; // 100MB
+  private static readonly UPLOAD_URL_EXPIRY = 15 * 60; // 15 minutes
+  private static readonly DOWNLOAD_URL_EXPIRY = 60 * 60; // 1 hour
+
+  private static readonly ALLOWED_MIME_TYPES = [
+    // Images
+    'image/jpeg', 'image/jpg', 'image/png', 'image/gif', 'image/webp',
+    // Videos
+    'video/mp4', 'video/mpeg', 'video/quicktime', 'video/webm',
+    // Audio
+    'audio/mpeg', 'audio/mp4', 'audio/wav', 'audio/ogg', 'audio/webm',
+    // Documents
+    'application/pdf', 'application/msword', 
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    'application/vnd.ms-excel',
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    'application/vnd.ms-powerpoint',
+    'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+    'text/plain',
+    // Archives
+    'application/zip', 'application/x-rar-compressed'
+  ];
+
+  /**
+   * Generate presigned upload URL
+   */
+  static async generateUploadUrl(uploadData: UploadUrlRequest): Promise<UploadUrlResponse> {
+    try {
+      // Validate file type
+      if (!this.ALLOWED_MIME_TYPES.includes(uploadData.mimeType)) {
+        throw new AppError('File type not allowed', 400);
+      }
+
+      // Validate file size
+      if (uploadData.fileSize > this.MAX_FILE_SIZE) {
+        throw new AppError(`File size cannot exceed ${this.MAX_FILE_SIZE / (1024 * 1024)}MB`, 400);
+      }
+
+      // Generate unique file key
+      const fileExtension = path.extname(uploadData.filename);
+      const uniqueFilename = `${crypto.randomUUID()}${fileExtension}`;
+      const s3Key = `uploads/${uploadData.userId}/${Date.now()}-${uniqueFilename}`;
+
+      // Create media file record
+      const mediaFile = await prisma.mediaFile.create({
+        data: {
+          filename: uniqueFilename,
+          originalFilename: uploadData.filename,
+          mimeType: uploadData.mimeType,
+          fileSize: uploadData.fileSize,
+          s3Key,
+          uploadedBy: uploadData.userId,
+          isEncrypted: !!uploadData.encryptionKey,
+          encryptionKey: uploadData.encryptionKey,
+          uploadStatus: 'PENDING'
+        }
+      });
+
+      // Generate presigned URL
+      const command = new PutObjectCommand({
+        Bucket: this.BUCKET_NAME,
+        Key: s3Key,
+        ContentType: uploadData.mimeType,
+        ContentLength: uploadData.fileSize,
+        Metadata: {
+          userId: uploadData.userId,
+          mediaFileId: mediaFile.id,
+          originalFilename: uploadData.filename
+        }
+      });
+
+      const uploadUrl = await getSignedUrl(s3Client, command, {
+        expiresIn: this.UPLOAD_URL_EXPIRY
+      });
+
+      // Cache upload info for verification
+      await RedisService.setCache(
+        `upload:${mediaFile.id}`,
+        {
+          userId: uploadData.userId,
+          s3Key,
+          expectedSize: uploadData.fileSize,
+          mimeType: uploadData.mimeType
+        },
+        this.UPLOAD_URL_EXPIRY
+      );
+
+      logger.info('Upload URL generated', { 
+        mediaFileId: mediaFile.id, 
+        userId: uploadData.userId,
+        fileSize: uploadData.fileSize,
+        mimeType: uploadData.mimeType
+      });
+
+      return {
+        uploadUrl,
+        mediaFileId: mediaFile.id,
+        expiresIn: this.UPLOAD_URL_EXPIRY,
+        maxFileSize: this.MAX_FILE_SIZE
+      };
+    } catch (error) {
+      logger.error('Error generating upload URL:', error);
+      throw error instanceof AppError ? error : new AppError('Failed to generate upload URL', 500);
+    }
+  }
+
+  /**
+   * Confirm upload completion
+   */
+  static async confirmUpload(mediaFileId: string, userId: string): Promise<MediaFileResponse> {
+    try {
+      const mediaFile = await prisma.mediaFile.findUnique({
+        where: { id: mediaFileId }
+      });
+
+      if (!mediaFile) {
+        throw new AppError('Media file not found', 404);
+      }
+
+      if (mediaFile.uploadedBy !== userId) {
+        throw new AppError('Not authorized to confirm this upload', 403);
+      }
+
+      if (mediaFile.uploadStatus === 'COMPLETED') {
+        throw new AppError('Upload already confirmed', 400);
+      }
+
+      // Verify file exists in S3
+      try {
+        const headCommand = new HeadObjectCommand({
+          Bucket: this.BUCKET_NAME,
+          Key: mediaFile.s3Key
+        });
+        
+        const headResult = await s3Client.send(headCommand);
+        
+        // Update file size if different
+        const actualSize = headResult.ContentLength || 0;
+        
+        // Update media file status
+        const updatedMediaFile = await prisma.mediaFile.update({
+          where: { id: mediaFileId },
+          data: {
+            uploadStatus: 'COMPLETED',
+            fileSize: actualSize,
+            uploadedAt: new Date()
+          }
+        });
+
+        // Clean up cache
+        await RedisService.deleteCache(`upload:${mediaFileId}`);
+
+        logger.info('Upload confirmed', { 
+          mediaFileId, 
+          userId,
+          actualSize,
+          s3Key: mediaFile.s3Key
+        });
+
+        return this.formatMediaFile(updatedMediaFile);
+      } catch (s3Error) {
+        // File not found in S3, mark as failed
+        await prisma.mediaFile.update({
+          where: { id: mediaFileId },
+          data: { uploadStatus: 'FAILED' }
+        });
+        
+        throw new AppError('File not found in storage', 404);
+      }
+    } catch (error) {
+      logger.error('Error confirming upload:', error);
+      throw error instanceof AppError ? error : new AppError('Failed to confirm upload', 500);
+    }
+  }
+
+  /**
+   * Get media file info
+   */
+  static async getMediaFile(mediaFileId: string, userId: string): Promise<MediaFileResponse> {
+    try {
+      const mediaFile = await prisma.mediaFile.findUnique({
+        where: { id: mediaFileId }
+      });
+
+      if (!mediaFile) {
+        throw new AppError('Media file not found', 404);
+      }
+
+      if (mediaFile.uploadStatus !== 'COMPLETED') {
+        throw new AppError('File upload not completed', 400);
+      }
+
+      // Check access permissions
+      const hasAccess = await this.checkFileAccess(mediaFileId, userId);
+      if (!hasAccess) {
+        throw new AppError('Not authorized to access this file', 403);
+      }
+
+      return this.formatMediaFile(mediaFile);
+    } catch (error) {
+      logger.error('Error getting media file:', error);
+      throw error instanceof AppError ? error : new AppError('Failed to get media file', 500);
+    }
+  }
+
+  /**
+   * Generate download URL
+   */
+  static async generateDownloadUrl(mediaFileId: string, userId: string): Promise<string> {
+    try {
+      const mediaFile = await prisma.mediaFile.findUnique({
+        where: { id: mediaFileId }
+      });
+
+      if (!mediaFile) {
+        throw new AppError('Media file not found', 404);
+      }
+
+      if (mediaFile.uploadStatus !== 'COMPLETED') {
+        throw new AppError('File upload not completed', 400);
+      }
+
+      // Check access permissions
+      const hasAccess = await this.checkFileAccess(mediaFileId, userId);
+      if (!hasAccess) {
+        throw new AppError('Not authorized to access this file', 403);
+      }
+
+      // Generate presigned download URL
+      const command = new GetObjectCommand({
+        Bucket: this.BUCKET_NAME,
+        Key: mediaFile.s3Key
+      });
+
+      const downloadUrl = await getSignedUrl(s3Client, command, {
+        expiresIn: this.DOWNLOAD_URL_EXPIRY
+      });
+
+      // Log download attempt
+      logger.info('Download URL generated', { 
+        mediaFileId, 
+        userId,
+        filename: mediaFile.filename
+      });
+
+      return downloadUrl;
+    } catch (error) {
+      logger.error('Error generating download URL:', error);
+      throw error instanceof AppError ? error : new AppError('Failed to generate download URL', 500);
+    }
+  }
+
+  /**
+   * Delete media file
+   */
+  static async deleteMediaFile(mediaFileId: string, userId: string): Promise<void> {
+    try {
+      const mediaFile = await prisma.mediaFile.findUnique({
+        where: { id: mediaFileId }
+      });
+
+      if (!mediaFile) {
+        throw new AppError('Media file not found', 404);
+      }
+
+      // Only uploader can delete file
+      if (mediaFile.uploadedBy !== userId) {
+        throw new AppError('Not authorized to delete this file', 403);
+      }
+
+      // Check if file is being used in messages
+      const messageCount = await prisma.message.count({
+        where: {
+          mediaFileId,
+          isDeleted: false
+        }
+      });
+
+      if (messageCount > 0) {
+        throw new AppError('Cannot delete file that is being used in messages', 400);
+      }
+
+      // Delete from S3
+      try {
+        const deleteCommand = new DeleteObjectCommand({
+          Bucket: this.BUCKET_NAME,
+          Key: mediaFile.s3Key
+        });
+        
+        await s3Client.send(deleteCommand);
+      } catch (s3Error) {
+        logger.warn('Failed to delete from S3, continuing with database cleanup', { 
+          s3Key: mediaFile.s3Key,
+          error: s3Error 
+        });
+      }
+
+      // Delete from database
+      await prisma.mediaFile.delete({
+        where: { id: mediaFileId }
+      });
+
+      logger.info('Media file deleted', { mediaFileId, userId });
+    } catch (error) {
+      logger.error('Error deleting media file:', error);
+      throw error instanceof AppError ? error : new AppError('Failed to delete media file', 500);
+    }
+  }
+
+  /**
+   * Get user's media files
+   */
+  static async getUserMediaFiles(
+    userId: string,
+    page: number = 1,
+    limit: number = 20,
+    mimeTypeFilter?: string
+  ): Promise<{ files: MediaFileResponse[]; total: number; hasMore: boolean }> {
+    try {
+      const offset = (page - 1) * limit;
+
+      let whereClause: any = {
+        uploadedBy: userId,
+        uploadStatus: 'COMPLETED'
+      };
+
+      if (mimeTypeFilter) {
+        whereClause.mimeType = { startsWith: mimeTypeFilter };
+      }
+
+      const [files, total] = await Promise.all([
+        prisma.mediaFile.findMany({
+          where: whereClause,
+          orderBy: { uploadedAt: 'desc' },
+          take: limit,
+          skip: offset
+        }),
+        prisma.mediaFile.count({ where: whereClause })
+      ]);
+
+      const hasMore = offset + files.length < total;
+
+      return {
+        files: files.map(file => this.formatMediaFile(file)),
+        total,
+        hasMore
+      };
+    } catch (error) {
+      logger.error('Error getting user media files:', error);
+      throw new AppError('Failed to get media files', 500);
+    }
+  }
+
+  /**
+   * Generate thumbnail for images/videos
+   */
+  static async generateThumbnail(mediaFileId: string): Promise<string | null> {
+    try {
+      // This would integrate with image processing service
+      // For now, returning null as placeholder
+      
+      logger.info('Thumbnail generation requested', { mediaFileId });
+      
+      return null;
+    } catch (error) {
+      logger.error('Error generating thumbnail:', error);
+      return null;
+    }
+  }
+
+  /**
+   * Clean up orphaned files
+   */
+  static async cleanupOrphanedFiles(): Promise<number> {
+    try {
+      // Find files older than 24 hours that are still pending
+      const orphanedFiles = await prisma.mediaFile.findMany({
+        where: {
+          uploadStatus: 'PENDING',
+          createdAt: {
+            lt: new Date(Date.now() - 24 * 60 * 60 * 1000)
+          }
+        }
+      });
+
+      let cleanedCount = 0;
+
+      for (const file of orphanedFiles) {
+        try {
+          // Try to delete from S3 if it exists
+          const deleteCommand = new DeleteObjectCommand({
+            Bucket: this.BUCKET_NAME,
+            Key: file.s3Key
+          });
+          
+          await s3Client.send(deleteCommand);
+        } catch (s3Error) {
+          // File might not exist, continue
+        }
+
+        // Delete from database
+        await prisma.mediaFile.delete({
+          where: { id: file.id }
+        });
+
+        cleanedCount++;
+      }
+
+      logger.info('Orphaned files cleaned up', { count: cleanedCount });
+      
+      return cleanedCount;
+    } catch (error) {
+      logger.error('Error cleaning up orphaned files:', error);
+      return 0;
+    }
+  }
+
+  // Helper methods
+  private static async checkFileAccess(mediaFileId: string, userId: string): Promise<boolean> {
+    // Check if user uploaded the file
+    const mediaFile = await prisma.mediaFile.findUnique({
+      where: { id: mediaFileId },
+      select: { uploadedBy: true }
+    });
+
+    if (mediaFile?.uploadedBy === userId) {
+      return true;
+    }
+
+    // Check if file is used in messages accessible to user
+    const messageAccess = await prisma.message.findFirst({
+      where: {
+        mediaFileId,
+        OR: [
+          { senderId: userId },
+          { recipientId: userId },
+          {
+            group: {
+              members: {
+                some: { userId }
+              }
+            }
+          }
+        ],
+        isDeleted: false
+      }
+    });
+
+    return !!messageAccess;
+  }
+
+  private static formatMediaFile(mediaFile: any): MediaFileResponse {
+    return {
+      id: mediaFile.id,
+      filename: mediaFile.filename,
+      originalFilename: mediaFile.originalFilename,
+      mimeType: mediaFile.mimeType,
+      fileSize: mediaFile.fileSize,
+      s3Key: mediaFile.s3Key,
+      isEncrypted: mediaFile.isEncrypted,
+      uploadedBy: mediaFile.uploadedBy,
+      uploadedAt: mediaFile.uploadedAt
+    };
+  }
+}
